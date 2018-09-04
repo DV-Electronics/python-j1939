@@ -74,9 +74,7 @@ class Bus(BusABC):
 
     def __init__(self, pdu_type=PDU, broadcast=True, *args, **kwargs):
         logger.debug("Creating a new j1939 bus")
-
-        #self.rx_can_message_queue = Queue()
-
+        
         self.queue = Queue()
         self.node_queue_list = []  # Start with nothing
 
@@ -145,8 +143,6 @@ class Bus(BusABC):
 
 
     def notification(self, inboundMessage):
-        #self.rx_can_message_queue.put(inboundMessage)
-
         if isinstance(inboundMessage, Message):
             logger.info('\n\nnotification: Got a Message from CAN: %s' % inboundMessage)
             if inboundMessage.id_type:
@@ -163,6 +159,7 @@ class Bus(BusABC):
                 arbitration_id = ArbitrationID()
                 arbitration_id.can_id = inboundMessage.arbitration_id
                 logger.debug('notification: ArbitrationID = %s' % (arbitration_id))
+                incomingPGN = PGN.from_can_id(inboundMessage.arbitration_id)
 
                 for (node, l_notifier) in self.node_queue_list:
                     logger.debug("notification: node=%s" % (node))
@@ -170,30 +167,19 @@ class Bus(BusABC):
                     logger.debug("              arbitration_id.pgn=%s" % (arbitration_id.pgn))
                     logger.debug("              destination_address=%s" % (arbitration_id.destination_address))
 
-                    # redirect the AC stuff to the node processors. the rest can go
-                    # to the main queue.
-                    if node and (arbitration_id.pgn in [PGN_AC_ADDRESS_CLAIMED, PGN_AC_COMMANDED_ADDRESS, PGN_REQUEST_FOR_PGN]):
+                    # redirect the AC stuff to the node processors. the rest can go to the main queue.
+                    if node and ((arbitration_id.pgn.value in [PGN_AC_COMMANDED_ADDRESS]) or \
+                                 (incomingPGN.pdu_format in [PGN_AC_ADDRESS_CLAIMED_PF, PGN_REQUEST_FOR_PGN_PF])):
                         logger.info("notification: sending to notifier queue")
                         # send the PDU to the node processor.
                         l_notifier.queue.put(inboundMessage)
-
-                    # if node has the destination address, do something with the PDU
-                    elif node and (arbitration_id.destination_address in node.address_list):
-                        rx_pdu = self._process_incoming_message(inboundMessage)
-                        if rx_pdu:
-                            logger.info("WP02: notification: sent to general queue: %s QQ=%s" % (rx_pdu, self.queue))
-                            self.queue.put(rx_pdu)
-                    elif node and (arbitration_id.destination_address is None):
-                        logger.info("notification: sending broadcast to general queue")
-                        rx_pdu = self._process_incoming_message(inboundMessage)
-                        logger.info("WP01: notification: sent broadcast to general queue: %s QQ=%s" % (rx_pdu, self.queue))
-                        self.queue.put(rx_pdu)
                     elif node is None:
                         # always send the message to the logging queue
                         logger.info("notification: sending to general queue")
                         rx_pdu = self._process_incoming_message(inboundMessage)
-                        logger.info("WP03: notification: sent pdu [%s] to general queue" % rx_pdu)
-                        self.queue.put(rx_pdu)
+                        if rx_pdu:
+                            logger.info("WP03: notification: sent pdu [%s] to general queue" % rx_pdu)
+                            self.queue.put(rx_pdu)
                     else:
                         logger.info("WP04: notification: pdu dropped: %s\n\n" % inboundMessage)
             else:
@@ -207,7 +193,7 @@ class Bus(BusABC):
         if not isinstance(node, Node):
             raise ValueError("bad parameter for node, must be a J1939 node object")
 
-        notifier = Notifier(Queue(), node.on_message_received, timeout=None)
+        notifier = Notifier(Queue(), [node.on_message_received], timeout=None)
         self.node_queue_list.append((node, notifier))
 
     def recv(self, timeout=None):
@@ -215,7 +201,6 @@ class Bus(BusABC):
         #logger.debug("Timeout is {}".format(timeout))
         logger.debug('J1939 Bus recv(), waiting on QQ=%s with timeout %s' % (self.queue, timeout))
         try:
-            #m = self.rx_can_message_queue.get(timeout=timeout)
             rx_pdu = self.queue.get(timeout=timeout)
             logger.info('J1939 Bus recv() successful QQ=%s, pdu:%s' % (self.queue, rx_pdu))
             return rx_pdu
@@ -304,13 +289,16 @@ class Bus(BusABC):
                 destination_address = DESTINATION_ADDRESS_GLOBAL
 
             logger.warning("rts arbitration id: src=%s, dest=%s" % (pdu.source, destination_address))
-            rts_arbitration_id = ArbitrationID(source_address=pdu.source, destination_address=destination_address)
-            rts_arbitration_id.pgn.value = PGN_TP_CONNECTION_MANAGEMENT
-            rts_arbitration_id.pgn.pdu_specific = pdu.arbitration_id.pgn.pdu_specific
+            rts_arbitration_id = ArbitrationID(pgn=(PGN_TP_CONNECTION_MANAGEMENT+pdu.arbitration_id.pgn.pdu_specific), 
+                                               source_address=pdu.source, destination_address=destination_address)
+            
+            logger.debug('rts_arbitration_id: %s'%str(rts_arbitration_id))
 
             temp_pgn = copy.deepcopy(pdu.arbitration_id.pgn)
             if temp_pgn.is_destination_specific:
                 temp_pgn.value -= temp_pgn.pdu_specific
+
+            logger.debug('temp_pgn: %s'%str(temp_pgn))
 
             pgn_msb = ((temp_pgn.value & 0xFF0000) >> 16)
             pgn_middle = ((temp_pgn.value & 0x00FF00) >> 8)
@@ -344,7 +332,8 @@ class Bus(BusABC):
                                   arbitration_id=rts_arbitration_id.can_id,
                                   data=[CM_MSG_TYPE_BAM,
                                         pdu_length_msb,
-                                        pdu_length_lsb, len(messages),
+                                        pdu_length_lsb, 
+                                        len(messages),
                                         0xFF,
                                         pgn_lsb,
                                         pgn_middle,
@@ -370,10 +359,17 @@ class Bus(BusABC):
         else:
             msg.display_radix = 'hex'
             logger.debug("j1939.send: calling can_bus_send: j1939-msg: %s" % (msg))
-            can_message = Message(arbitration_id=msg.arbitration_id.can_id,
+
+            if isinstance(msg, Message):
+                can_message = msg
+            elif isinstance(msg, PDU):
+                can_message = Message(arbitration_id=msg.arbitration_id.can_id,
                                   extended_id=True,
                                   dlc=len(msg.data),
                                   data=msg.data)
+            else:
+                logger.warning("invalid message type passed to send")
+                raise
 
             logger.debug("j1939.send: calling can_bus_send: can-msg: %s" % can_message)
             try:
@@ -382,6 +378,30 @@ class Bus(BusABC):
                 if self._ignore_can_send_error:
                     pass
                 raise
+
+    def send_periodic(self, msg, period, duration=None):
+        logger.info("j1939.send_periodic: msg=%s" % msg)
+
+        if len(msg.data) > 8:
+            logger.warning("can't send message longer than 8 bytes periodically")
+            raise
+
+        txMsg = None
+
+        if isinstance(msg, Message):
+            txMsg = msg
+        #elif isinstance(msg, PDU):
+        #    logger.debug('creating CAN message from PDU')
+        #    txMsg = Message(arbitration_id=msg.arbitration_id.can_id, data=msg.data, extended_id=True)  # user needs to use this message and modify the data in order to do task.modify_data
+        else:
+            logger.warning("invalid message type passed to send_periodic")
+            raise
+
+        logger.info('starting periodic message transmission [CAN-ID 0x%X, period %d sec, duration %s]'%(
+            txMsg.arbitration_id, period, duration))
+
+        #return {'task':self.can_bus.send_periodic(txMsg, period, duration), 'message':txMsg}
+        return self.can_bus.send_periodic(txMsg, period, duration)
 
     def shutdown(self):
         self.can_notifier.running.clear()
@@ -477,20 +497,20 @@ class Bus(BusABC):
 
     def _data_transfer_handler(self, msg):
         logger.debug("_data_transfer_handler:")
+
         msg_source = msg.arbitration_id.source_address
         pdu_specific = msg.arbitration_id.pgn.pdu_specific
 
-        if msg_source in self._incomplete_received_pdus:
+        logger.debug("msg_source: 0x%X, pdu_specific: 0x%X"%(msg_source,pdu_specific))
 
+        if msg_source in self._incomplete_received_pdus:
             logger.debug("in self._incomplete_received_pdus:")
             if pdu_specific in self._incomplete_received_pdus[msg_source]:
                 logger.debug("in self._incomplete_received_pdus[msg_source]:")
                 self._incomplete_received_pdus[msg_source][pdu_specific].data.extend(msg.data[1:])
                 total = self._incomplete_received_pdu_lengths[msg_source][pdu_specific]["total"]
                 if len(self._incomplete_received_pdus[msg_source][pdu_specific].data) >= total:
-                    logger.debug("allReceived: %s" % type(self._incomplete_received_pdus[msg_source]))
-                    logger.debug("allReceived: %s" % pprint.pformat(self._incomplete_received_pdus[msg_source]))
-                    logger.debug("allReceived: %s from 0x%x" % (type(self._incomplete_received_pdus[msg_source][pdu_specific]), pdu_specific))
+                    logger.debug("allReceived: from 0x%x to 0x%x" % (msg_source,pdu_specific))
                     logger.debug("allReceived: %s" % (self._incomplete_received_pdus[msg_source][pdu_specific]))
                     if pdu_specific == DESTINATION_ADDRESS_GLOBAL:
                         logger.debug("pdu_specific == DESTINATION_ADDRESS_GLOBAL")
@@ -512,9 +532,8 @@ class Bus(BusABC):
                     if send_ack:
                         arbitration_id = ArbitrationID()
                         arbitration_id.pgn.value = PGN_TP_CONNECTION_MANAGEMENT
-                        arbitration_id.pgn.pdu_specific = msg_source
                         arbitration_id.source_address = pdu_specific
-                        arbitration_id.destination_address = 0x17
+                        arbitration_id.destination_address = msg_source
 
                         total_length = self._incomplete_received_pdu_lengths[msg_source][pdu_specific]["total"]
                         _num_packages = self._incomplete_received_pdu_lengths[msg_source][pdu_specific]["num_packages"]
@@ -525,8 +544,7 @@ class Bus(BusABC):
 
                         logger.debug("in send_ack: arbitration_id=[%s], can_id=[%x], destAdder=0x%0x" %
                                 (arbitration_id, int(arbitration_id.can_id), arbitration_id.destination_address))
-                        logger.debug("in send_ack: " %
-                                ())
+
                         div, mod = divmod(total_length, 256)
                         can_message = Message(arbitration_id=arbitration_id.can_id,
                                               extended_id=True,
@@ -563,8 +581,8 @@ class Bus(BusABC):
 
         if msg.data[0] == CM_MSG_TYPE_BAM:
             logger.debug("CM_MSG_TYPE_BAM")
-            self._incomplete_received_pdus[msg.arbitration_id.source_address][0xFF] = self._pdu_type()
-            self._incomplete_received_pdus[msg.arbitration_id.source_address][0xFF].arbitration_id.pgn.value = int(
+            self._incomplete_received_pdus[msg.arbitration_id.source_address][DESTINATION_ADDRESS_GLOBAL] = self._pdu_type()
+            self._incomplete_received_pdus[msg.arbitration_id.source_address][DESTINATION_ADDRESS_GLOBAL].arbitration_id.pgn.value = int(
                 ("%.2X%.2X%.2X" % (msg.data[7], msg.data[6], msg.data[5])), 16)
             if self._incomplete_received_pdus[msg.arbitration_id.source_address][
                     0xFF].arbitration_id.pgn.is_destination_specific:
@@ -572,23 +590,24 @@ class Bus(BusABC):
                     0xFF].arbitration_id.pgn.pdu_specific = msg.arbitration_id.pgn.pdu_specific
             self._incomplete_received_pdus[msg.arbitration_id.source_address][
                 0xFF].arbitration_id.source_address = msg.arbitration_id.source_address
-            self._incomplete_received_pdus[msg.arbitration_id.source_address][0xFF].data = []
+            self._incomplete_received_pdus[msg.arbitration_id.source_address][DESTINATION_ADDRESS_GLOBAL].data = []
             _message_size = int("%.2X%.2X" % (msg.data[2], msg.data[1]), 16)
-            self._incomplete_received_pdu_lengths[msg.arbitration_id.source_address][0xFF] = {"total": _message_size,
+            self._incomplete_received_pdu_lengths[msg.arbitration_id.source_address][DESTINATION_ADDRESS_GLOBAL] = {
+                                                                                              "total": _message_size,
                                                                                               "chunk": 255,
-                                                                                              "num_packages": msg.data[
-                                                                                                  3], }
+                                                                                              "num_packages": msg.data[3],
+                                                                                              }
         else:
             logger.debug("not CM_MSG_TYPE_BAM, source=0x%x" % (msg.arbitration_id.source_address))
-            self._incomplete_received_pdus[msg.arbitration_id.source_address][
-                msg.arbitration_id.pgn.pdu_specific] = self._pdu_type()
+            self._incomplete_received_pdus[msg.arbitration_id.source_address][msg.arbitration_id.pgn.pdu_specific] = self._pdu_type()
             self._incomplete_received_pdus[msg.arbitration_id.source_address][
                 msg.arbitration_id.pgn.pdu_specific].arbitration_id.pgn.value = int(
                 ("%.2X%.2X%.2X" % (msg.data[7], msg.data[6], msg.data[5])), 16)
             if self._incomplete_received_pdus[msg.arbitration_id.source_address][
                     msg.arbitration_id.pgn.pdu_specific].arbitration_id.pgn.is_destination_specific:
                 self._incomplete_received_pdus[msg.arbitration_id.source_address][
-                    msg.arbitration_id.pgn.pdu_specific].arbitration_id.pgn.pdu_specific = msg.arbitration_id.pgn.pdu_specific
+                    msg.arbitration_id.pgn.pdu_specific].arbitration_id.destination_address = msg.arbitration_id.pgn.pdu_specific
+                    #msg.arbitration_id.pgn.pdu_specific].arbitration_id.pgn.pdu_specific = msg.arbitration_id.pgn.pdu_specific
             self._incomplete_received_pdus[msg.arbitration_id.source_address][
                 msg.arbitration_id.pgn.pdu_specific].arbitration_id.source_address = msg.arbitration_id.source_address
             self._incomplete_received_pdus[msg.arbitration_id.source_address][
@@ -622,8 +641,7 @@ class Bus(BusABC):
                         _data = [0x11, msg.data[4], 0x01, 0xFF, 0xFF]
                         _data.extend(msg.data[5:])
                         logger.debug("send CTS: AID: %s" % _cts_arbitration_id)
-                        cts_msg = Message(extended_id=True, arbitration_id=_cts_arbitration_id.can_id, data=_data,
-                                          dlc=8)
+                        cts_msg = Message(extended_id=True, arbitration_id=_cts_arbitration_id.can_id, data=_data, dlc=8)
 
                         # send clear to send
                         logger.debug("send CTS: %s" % cts_msg)
@@ -661,22 +679,33 @@ class Bus(BusABC):
     """
 
     def _process_cts(self, msg):
-        logger.debug("_process_cts")
+        logger.debug("_process_cts msg.arbitration_id.pgn.pdu_specific=0x%X, msg.arbitration_id.source_address=0x%X"%(msg.arbitration_id.pgn.pdu_specific,msg.arbitration_id.source_address))
         if msg.arbitration_id.pgn.pdu_specific in self._incomplete_transmitted_pdus:
-            if msg.arbitration_id.source_address in self._incomplete_transmitted_pdus[
-                    msg.arbitration_id.pgn.pdu_specific]:
+            if msg.arbitration_id.source_address in self._incomplete_transmitted_pdus[msg.arbitration_id.pgn.pdu_specific]:
                 # Next packet number in CTS message (Packet numbers start at 1 not 0)
+                if msg.data[2] < 1:
+                    logger.warning('invalid starting index (should be >= 1): ' + str(msg.data[2]))
+                    raise
                 start_index = msg.data[2] - 1
                 # Using total number of packets in CTS message
                 end_index = start_index + msg.data[1]
-                for _msg in self._incomplete_transmitted_pdus[msg.arbitration_id.pgn.pdu_specific][
-                        msg.arbitration_id.source_address][start_index:end_index]:
+                logger.debug('sending partial message...start_index=%d, end_index=%d'%(start_index,end_index))
+                for _msg in self._incomplete_transmitted_pdus[msg.arbitration_id.pgn.pdu_specific][msg.arbitration_id.source_address][start_index:end_index]:
                     try:
-                        self.can_bus.send(msg)
+                        logger.debug('sending: ' + str(_msg))
+                        self.can_bus.send(_msg)
                     except CanError:
                         if self._ignore_can_send_error:
                             pass
                         raise
+            else:
+                logger.warning("didn't find msg.arbitration_id.source_address in _incomplete_transmitted_pdus[msg.arbitration_id.pgn.pdu_specific], which are: ")
+                for inc in self._incomplete_transmitted_pdus[msg.arbitration_id.pgn.pdu_specific]:
+                    logger.warning(str(inc))
+        else:
+            logger.warning("didn't find msg.arbitration_id.pgn.pdu_specific in _incomplete_transmitted_pdus, which are: ")
+            for inc in self._incomplete_transmitted_pdus:
+                logger.warning(str(inc))
 
     def _process_eom_ack(self, msg):
         logger.debug("_process_eom_ack")

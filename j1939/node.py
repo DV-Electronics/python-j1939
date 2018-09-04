@@ -1,11 +1,13 @@
 import logging
 
-log = logging.getLogger('py1939.node')
-log.debug('Loading J1939 node')
+#log = logging.getLogger('py1939.node')
+#log.debug('Loading J1939 node')
 
 from can import Listener, CanError
+from j1939.arbitrationid import ArbitrationID
 from j1939.constants import *
 from j1939.pdu import PDU
+from j1939.pgn import PGN
 from j1939.nodename import NodeName
 
 logger = logging.getLogger(__name__)
@@ -53,67 +55,85 @@ class Node(Listener):
     def address(self):
         return self.known_node_addresses[self.node_name.value]
 
-    @property
-    def address(self):
-        return self.address_list
-
     def start_address_claim(self):
-        logging.debug("start_address_claim:")
-        self.claim_address(self.address_list[self._current_address_index])
+        logger.debug("start_address_claim:")
+        if self._current_address_index >= len(self.address_list):
+            self.claim_address(DESTINATION_ADDRESS_NULL)
+        else:
+            self.claim_address(self.address_list[self._current_address_index])
 
     def claim_address(self, address):
-        logging.debug("claim_address:")
+        logger.debug("claim_address:")
         claimed_address_pdu = self._pdu_type()
         claimed_address_pdu.arbitration_id.pgn.value = PGN_AC_ADDRESS_CLAIMED
-        claimed_address_pdu.arbitration_id.priority = 4
-        claimed_address_pdu.arbitration_id.pgn.pdu_specific = 0xff
+        claimed_address_pdu.arbitration_id.priority = 6
         claimed_address_pdu.arbitration_id.source_address = address
-        claimed_address_pdu.arbitration_id.destination_address_value = 0xff
+        claimed_address_pdu.arbitration_id.destination_address_value = DESTINATION_ADDRESS_GLOBAL
 
         claimed_address_pdu.data = self.node_name.bytes
         self.known_node_addresses[self.node_name.value] = address
-        log.info('MIL:')
-        log.info('claimed_address_pdu: %s' % claimed_address_pdu)
+        logger.info('MIL:')
+        logger.info('claimed_address_pdu: %s' % claimed_address_pdu)
         self.bus.send(claimed_address_pdu)
 
-    def on_message_received(self, pdu):
-        if pdu.pgn == PGN_AC_ADDRESS_CLAIMED:
-            log.debug('got PGN_AC_ADDRESS_CLAIMED pdu')
-            if pdu.source != DESTINATION_ADDRESS_NULL:
-                if pdu.data != self.node_name.bytes:
-                    if pdu.source != self.address:
-                        node_name = NodeName()
-                        node_name.bytes = pdu.data
-                        self.known_node_addresses[node_name.value] = pdu.source
-                    else:
-                        competing_node_name = NodeName()
-                        competing_node_name.bytes = pdu.data
-                        if self.node_name.value > competing_node_name.value:
-                            self._current_address_index += 1
-                            if self._current_address_index >= len(self.address_list):
-                                self.claim_address(DESTINATION_ADDRESS_NULL)
-                            else:
-                                self.claim_address(self.address_list[self._current_address_index])
-                        else:
-                            self.claim_address(self.address)
-            else:
+    def on_message_received(self, inboundMessage):
+        arbitration_id = ArbitrationID()
+        arbitration_id.can_id = inboundMessage.arbitration_id
+        incomingPDU = PDU(arbitration_id=arbitration_id, data=inboundMessage.data)
+        incomingPGN = PGN.from_can_id(inboundMessage.arbitration_id)
+        logger.debug('node got message from SA %X, PDU format %X, PDU specific %X'%(incomingPDU.source,incomingPGN.pdu_format,incomingPGN.pdu_specific))
+
+        if incomingPGN.pdu_format == PGN_AC_ADDRESS_CLAIMED_PF:
+            logger.debug('got PGN_AC_ADDRESS_CLAIMED pdu')
+            # todo 
+            #   - wait 250ms after address claim to allow other nodes to dispute address (if address not in 0..127, 248..253)
+            
+            if (incomingPDU.source == DESTINATION_ADDRESS_NULL) and (incomingPDU.destination == DESTINATION_ADDRESS_GLOBAL):
+                logger.debug('handle Request for Address Claim query (SA 0xFE, DA 0xFF)')
+                self.start_address_claim()
+                return
+
+            if incomingPDU.source != self.address:
                 node_name = NodeName()
-                node_name.bytes = pdu.data
-                self.known_node_addresses[node_name.value] = pdu.source
-        elif pdu.pgn == PGN_AC_COMMANDED_ADDRESS:
-            log.debug('got PGN_AC_COMMANDED_ADDRESS pdu')
+                node_name.bytes = incomingPDU.data
+                self.known_node_addresses[node_name.value] = incomingPDU.source
+            else:
+                logger.debug('competing node trying to claim our CA')
+                competing_node_name = NodeName()
+                competing_node_name.bytes = incomingPDU.data
+                if self.node_name.value > competing_node_name.value:
+                    logger.debug('another node claimed our CA')
+                    self.known_node_addresses[competing_node_name.value] = incomingPDU.source
+
+                    self._current_address_index += 1
+
+                    if self._current_address_index >= len(self.address_list):
+                        logger.debug("we don't have any more alternative CAs")
+                    else:
+                        logger.debug('try to claim our next CA')
+
+                    self.start_address_claim()
+                else:
+                    logger.debug("disputing competing node's address claim")
+                    self.claim_address(self.address)
+
+        elif incomingPDU.pgn == PGN_AC_COMMANDED_ADDRESS:
+            logger.debug('got PGN_AC_COMMANDED_ADDRESS pdu')
             node_name = NodeName()
-            node_name.bytes = pdu.data[:8]
-            new_address = pdu.data[8]
+            node_name.bytes = incomingPDU.data[:8]
+            new_address = incomingPDU.data[8]
             if node_name.value == self.node_name.value:
                 # if we are the commanded node change our address
                 self.claim_address(new_address)
-        elif pdu.pgn == PGN_REQUEST_FOR_PGN:
-            log.debug('got PGN_REQUEST_FOR_PGN pdu')
-            pgn = int("%.2X%.2X%.2X" % (pdu.data[2], pdu.data[1], pdu.data[0]), 16)
-            if pdu.destination in (self.address, DESTINATION_ADDRESS_GLOBAL):
+
+        elif incomingPGN.pdu_format == PGN_REQUEST_FOR_PGN_PF:
+            logger.debug('got PGN_REQUEST_FOR_PGN pdu')
+            pgn = int("%.2X%.2X%.2X" % (incomingPDU.data[2], incomingPDU.data[1], incomingPDU.data[0]), 16)
+            if incomingPDU.destination in (self.address, DESTINATION_ADDRESS_GLOBAL):
                 if pgn == PGN_AC_ADDRESS_CLAIMED:
                     self.claim_address(self.known_node_addresses[self.node_name.value])
+        else:
+            logger.debug('node got unknown PGN: ' + str(incomingPDU.pgn))
 
 
     def send_parameter_group(self, pgn, data, destination_device_name=None):
@@ -126,10 +146,10 @@ class Node(Listener):
         :param destination_device_name:
             Should be None, or an int between 0 and (2 ** 64) - 1
         """
-        log.debug('send_parameter_group:')
+        logger.debug('send_parameter_group:')
         # if we are *allowed* to send data
         if self.known_node_addresses[self.node_name.value] not in (ADDRESS_UNCLAIMED, DESTINATION_ADDRESS_NULL):
-            log.debug('send_parameter_group: claimed address')
+            logger.debug('send_parameter_group: claimed address')
             pdu = self._pdu_type()
             pdu.arbitration_id.pgn.value = pgn
             pdu.arbitration_id.source_address = self.known_node_addresses[self.node_name.value]

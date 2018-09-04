@@ -2,7 +2,7 @@ import logging
 
 from j1939.pgn import PGN
 from j1939.constants import *
-import logging
+
 logger = logging.getLogger(__name__)
 
 class ArbitrationID(object):
@@ -37,18 +37,18 @@ class ArbitrationID(object):
 
         #self.pgn = pgn
 
-        if pgn:
+        if self._pgn:
             if self._pgn.is_destination_specific:
                 if destination_address is None:
                     self.destination_address_value = DESTINATION_ADDRESS_GLOBAL
                 else:
                     if destination_address >= 0 and destination_address <= 255:
                         self.destination_address_value = destination_address
-                        if  self.destination_address_value != pgn.pdu_specific:
+                        if  self.destination_address_value != self._pgn.pdu_specific:
                                 logger.debug("self._pgn=%s, self.destination_address_value = %x, pgn.pdu_specific = %x" %
-                                        (self._pgn, self.destination_address_value, pgn.pdu_specific))
+                                        (self._pgn, self.destination_address_value, self._pgn.pdu_specific))
 
-#                        assert( self.destination_address_value == pgn.pdu_specific)
+#                        assert( self.destination_address_value == self._pgn.pdu_specific)
                     else:
                         raise ValueError("destination address must be in range (0-255)")
 
